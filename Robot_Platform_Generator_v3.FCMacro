@@ -1,0 +1,995 @@
+# -*- coding: utf-8 -*-
+#
+#  BSD 3-Clause License
+#
+#  Copyright (c) 2026, Honda Research Institute Europe GmbH
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions are met:
+#
+#  1. Redistributions of source code must retain the above copyright notice, this
+#     list of conditions and the following disclaimer.
+#
+#  2. Redistributions in binary form must reproduce the above copyright notice,
+#     this list of conditions and the following disclaimer in the documentation
+#     and/or other materials provided with the distribution.
+#
+#  3. Neither the name of the copyright holder nor the names of its
+#     contributors may be used to endorse or promote products derived from
+#     this software without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+#  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+#  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+#  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+#  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+#  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#  SPDX-License-Identifier: BSD-3-Clause
+#
+"""Robot_Platform_Generator_v3  --  parametric robotic-platform macro
+
+Summary
+-----
+1.  Layout : Rectangular | Circular | Triangular   (drop-down)
+2.  Wheels : No wheels | 3 wheels | 4 wheels       (drop-down)
+3.  Sliders: platform thickness / width / length / height, wheel diameter,
+             wheel thickness, + wheel-axis height / base / track
+4.  All generated objects are placed in one ``App::DocumentObjectGroup``
+    named "RobotPlatform".
+5.  The bounding box is checked against 300 x 300 x 200 mm.
+
+Units: millimetres, Z up, floor at z = 0.  Run it (Macros -> Run or the
+Macro-menu entry) and the "Robotic Platform" panel docks into FreeCAD.
+The layout / wheel / bounding-box maths is Part-free and unit-testable.
+"""
+
+from __future__ import annotations
+
+import math
+
+__version__ = "3.0-v3"
+
+# --------------------------------------------------------------------------- #
+# 0. Design space (millimetres / ratios)
+# --------------------------------------------------------------------------- #
+# key -> dict(label, lo, hi, default, dec, unit)
+NUMERIC_SPEC = {
+    "platform_length":    dict(label="Platform length",   lo=60.0, hi=320.0, default=240.0, dec=1, unit="mm"),
+    "platform_width":     dict(label="Platform width",    lo=60.0, hi=320.0, default=180.0, dec=1, unit="mm"),
+    "platform_thickness": dict(label="Platform thickness", lo=5.0, hi=80.0,  default=18.0,  dec=1, unit="mm"),
+    "platform_height":    dict(label="Platform height",   lo=10.0, hi=190.0, default=55.0,  dec=1, unit="mm"),
+    "wheel_diameter":     dict(label="Wheel diameter",    lo=20.0, hi=180.0, default=90.0,  dec=1, unit="mm"),
+    "wheel_thickness":    dict(label="Wheel thickness",   lo=8.0,  hi=80.0,  default=30.0,  dec=1, unit="mm"),
+    "wheel_axis_height":  dict(label="Wheel axis height", lo=5.0,  hi=190.0, default=45.0,  dec=1, unit="mm"),
+    "wheel_base_pct":     dict(label="Wheel base (frac. of length)", lo=0.30, hi=1.0, default=0.72, dec=2, unit=""),
+    "wheel_track_pct":    dict(label="Wheel track (frac. of width)", lo=0.30, hi=1.0, default=0.78, dec=2, unit=""),
+}
+NUMERIC_KEYS = list(NUMERIC_SPEC.keys())
+
+LAYOUTS = ["Rectangular", "Circular", "Triangular"]
+WHEEL_OPTIONS = ["No wheels", "3 wheels", "4 wheels"]
+WHEEL_COUNT = {"No wheels": 0, "3 wheels": 3, "4 wheels": 4}
+
+BBOX_LIMITS = (300.0, 300.0, 200.0)
+BBOX_NAME = "300 x 300 x 200 mm"
+
+GROUP_NAME = "RobotPlatform"
+CFG_NAME = "PlatformConfig"
+DECK_NAME = "RobotDeck"
+WHEEL_PREFIX = "RobotWheel"
+DOCK_NAME = "RobotPlatformDock"
+DOCK_TITLE = "Robotic Platform"
+DECK_LABELS = {"Rectangular": "Rect", "Circular": "Circ", "Triangular": "Tri"}
+DECK_COLOR = (0.83, 0.55, 0.14)
+WHEEL_COLOR = (0.16, 0.16, 0.18)
+
+
+def default_params():
+    return {k: v["default"] for k, v in NUMERIC_SPEC.items()}
+
+
+def clamp_params(raw):
+    out = {}
+    for k, s in NUMERIC_SPEC.items():
+        v = raw.get(k, s["default"])
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = s["default"]
+        out[k] = min(max(v, s["lo"]), s["hi"])
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 1. Part-free placement maths (unit-testable)
+# --------------------------------------------------------------------------- #
+def wheel_positions(layout, count, length, width, base_pct, track_pct):
+    """Wheel-centre (x, y) positions.
+
+    ``base_pct`` / ``track_pct`` are fractions of the half-length / half-width
+    and place the axles longitudinally / laterally; 1.0 puts them right at the
+    deck edge.  Circular layouts sit on an ellipse of semi-axes
+    (base_pct*L/2, track_pct*W/2); triangular layouts have the apex toward +Y.
+    """
+    if count <= 0:
+        return []
+    ax = min(max(float(base_pct), 0.0), 1.0) * length / 2.0
+    ay = min(max(float(track_pct), 0.0), 1.0) * width / 2.0
+    if layout == "Circular":
+        angles = {3: (90, 210, 330), 4: (45, 135, 225, 315)}.get(count)
+        if angles is None:
+            angles = tuple(360.0 * i / count for i in range(count))
+        return [(ax * math.cos(math.radians(a)), ay * math.sin(math.radians(a)))
+                for a in angles]
+    if layout == "Triangular":
+        if count == 3:
+            return [(-ax, -ay), (ax, -ay), (0.0, ay * 0.9)]
+        return [(-ax, -ay), (ax, -ay), (-ax * 0.5, ay * 0.55), (ax * 0.5, ay * 0.55)]
+    # Rectangular
+    if count == 3:
+        return [(-ax, -ay), (ax, -ay), (0.0, ay)]
+    if count == 4:
+        return [(-ax, -ay), (ax, -ay), (-ax, ay), (ax, ay)]
+    return [(-ax, -ay), (ax, -ay), (0.0, ay)]
+
+
+def overall_extents(layout, count, length, width, thickness, height,
+                    diameter, wheel_t, axis_height, base_pct, track_pct):
+    """Overall (dx, dy, dz) of the platform; mirrors the 3D model exactly."""
+    pos = wheel_positions(layout, count, length, width, base_pct, track_pct)
+    r = diameter / 2.0
+    xmin, xmax = -length / 2.0, length / 2.0
+    ymin, ymax = -width / 2.0, width / 2.0
+    zmin, zmax = height, height + thickness
+    for (x, y) in pos:
+        xmin, xmax = min(xmin, x - r), max(xmax, x + r)
+        ymin, ymax = min(ymin, y - wheel_t / 2.0), max(ymax, y + wheel_t / 2.0)
+        zmin, zmax = min(zmin, axis_height - r), max(zmax, axis_height + r)
+    return (xmax - xmin, ymax - ymin, zmax - zmin)
+
+
+def fit_check(dx, dy, dz, limits=BBOX_LIMITS):
+    over = []
+    for name, d, lim in zip(("L-X", "W-Y", "H-Z"), (dx, dy, dz), limits):
+        if d > lim + 1e-6:
+            over.append("%s %.1f>%.0f" % (name, d, lim))
+    msg = "bbox %.0fx%.0fx%.0f mm (limit %s)" % (dx, dy, dz, BBOX_NAME)
+    if over:
+        return False, msg + "  --  DOES NOT FIT: " + ", ".join(over)
+    return True, msg + "  --  fits"
+
+
+# --------------------------------------------------------------------------- #
+# 2. Part Design builders (Body + Sketch + Pad).  One solid == one Body.
+# --------------------------------------------------------------------------- #
+def _V(x, y, z):
+    import FreeCAD as App
+    return App.Vector(x, y, z)
+
+
+def _clear_sketch(sk):
+    try:
+        while sk.GeometryCount:
+            sk.delGeometry(0)
+    except Exception:
+        pass
+
+
+def _draw_rect(sk, length, width):
+    import Part
+    hx, hy = length / 2.0, width / 2.0
+    pts = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)]
+    for i in range(4):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % 4]
+        sk.addGeometry(Part.LineSegment(_V(x0, y0, 0), _V(x1, y1, 0)), False)
+
+
+def _draw_triangle(sk, length, width):
+    import Part
+    hx, hy = length / 2.0, width / 2.0
+    pts = [(-hx, -hy), (hx, -hy), (0.0, hy)]
+    for i in range(3):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % 3]
+        sk.addGeometry(Part.LineSegment(_V(x0, y0, 0), _V(x1, y1, 0)), False)
+
+
+def _draw_ellipse(sk, length, width):
+    import Part
+    major, minor = max(length, width) / 2.0, min(length, width) / 2.0
+    try:
+        sk.addGeometry(Part.Ellipse(_V(0, 0, 0), major, minor), False)
+        return
+    except Exception:
+        pass
+    sk.addGeometry(Part.Circle(_V(0, 0, 0), _V(0, 0, 1), minor), False)
+
+
+def _draw_circle(sk, radius):
+    import Part
+    sk.addGeometry(Part.Circle(_V(0, 0, 0), _V(0, 0, 1), max(radius, 1e-3)), False)
+
+
+def _recompute(doc):
+    try:
+        doc.recompute(None, True, True)
+    except Exception:
+        try:
+            doc.recompute()
+        except Exception:
+            pass
+
+
+def _make_solid_body(doc, name, draw_fn, pad_length, placement, midplane, color, label):
+    """Create a Part Design Body whose tip is a Pad of a closed profile sketch."""
+    body = doc.addObject("PartDesign::Body", name)
+    body.Label = label
+    sketch = doc.addObject("Sketcher::SketchObject", name + "_Sketch")
+    body.addObject(sketch)
+    _clear_sketch(sketch)
+    draw_fn(sketch)
+    pad = doc.addObject("PartDesign::Pad", name + "_Pad")
+    body.addObject(pad)
+    pad.Profile = sketch
+    pad.Length = float(max(pad_length, 1e-3))
+    pad.SideType = "Symmetric"
+    try:
+        pad.Midplane = bool(midplane)
+    except Exception:
+        pass
+    body.Tip = pad
+    body.Placement = placement
+    try:
+        sketch.Visibility = False
+    except Exception:
+        pass
+    _recompute(doc)
+    if body.ViewObject is not None:
+        try:
+            body.ViewObject.ShapeColor = color
+            body.ViewObject.Visibility = True
+        except Exception:
+            pass
+    return body
+
+
+def _solid_ok(body):
+    try:
+        sh = body.Shape
+        return sh is not None and not sh.isNull() and sh.Volume > 1e-6
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# 3. Parametric controller (property holder; no geometry in callbacks)
+# --------------------------------------------------------------------------- #
+def _add_prop(obj, ptype, name, group, doc, default=None):
+    if name not in obj.PropertiesList:
+        obj.addProperty(ptype, name, group, doc)
+    if default is not None:
+        try:
+            setattr(obj, name, default)
+        except Exception:
+            pass
+
+
+class PlatformController:
+    """Proxy of the App::FeaturePython holding every design parameter."""
+
+    def __init__(self, obj):
+        obj.addProperty("App::PropertyEnumeration", "Layout", "Platform", "Deck layout")
+        obj.Layout = LAYOUTS
+        obj.Layout = LAYOUTS[0]
+        obj.addProperty("App::PropertyEnumeration", "Wheels", "Platform", "Wheel config")
+        obj.Wheels = WHEEL_OPTIONS
+        obj.Wheels = WHEEL_OPTIONS[2]
+        for key, s in NUMERIC_SPEC.items():
+            _add_prop(obj, "App::PropertyFloat", key, "Dimensions",
+                      "%s (mm)" % s["label"] if s["unit"] == "mm" else s["label"],
+                      s["default"])
+        for d in ("ExtentX", "ExtentY", "ExtentZ"):
+            _add_prop(obj, "App::PropertyFloat", d, "Check", "Computed extent (mm)", 0.0)
+        _add_prop(obj, "App::PropertyString", "FitStatus", "Check", "Bounding-box result", "")
+        _add_prop(obj, "App::PropertyBool", "FitsBBox", "Check",
+                  "Fits %s" % BBOX_NAME, True)
+        obj.Proxy = self
+
+    def execute(self, obj):
+        pass                          # generation is done by rebuild(), not here
+
+
+class ControllerViewProvider:
+    def __init__(self, vobj):
+        try:
+            vobj.Proxy = self
+        except Exception:
+            pass
+
+    def attach(self, vobj):
+        self.Object = vobj.Object
+
+    def doubleClicked(self, vobj):
+        try:
+            show_dock()
+        except Exception:
+            pass
+        return True
+
+    def setEdit(self, vobj, mode=0):
+        return False
+
+    def unsetEdit(self, vobj, mode=0):
+        return None
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state or {})
+
+
+def read_cfg(obj):
+    """Controller -> kwargs dict for the geometry functions."""
+    n = clamp_params({k: getattr(obj, k, None) for k in NUMERIC_KEYS})
+    layout = getattr(obj, "Layout", LAYOUTS[0])
+    if layout not in LAYOUTS:
+        layout = LAYOUTS[0]
+    return dict(layout=layout,
+                count=WHEEL_COUNT.get(getattr(obj, "Wheels", WHEEL_OPTIONS[2]), 4),
+                length=n["platform_length"], width=n["platform_width"],
+                thickness=n["platform_thickness"], height=n["platform_height"],
+                diameter=n["wheel_diameter"], wheel_t=n["wheel_thickness"],
+                axis_height=n["wheel_axis_height"],
+                base_pct=n["wheel_base_pct"], track_pct=n["wheel_track_pct"])
+
+
+# --------------------------------------------------------------------------- #
+# 4. Lookup / teardown helpers
+# --------------------------------------------------------------------------- #
+def find_group(doc):
+    if doc is None:
+        return None
+    return next((o for o in doc.Objects
+                 if o.TypeId == "App::DocumentObjectGroup" and o.Name.startswith(GROUP_NAME)), None)
+
+
+def find_cfg(doc):
+    if doc is None:
+        return None
+    return next((o for o in doc.Objects
+                 if o.TypeId == "App::FeaturePython" and o.Name.startswith(CFG_NAME)), None)
+
+
+def _generated_bodies(doc):
+    return [o for o in doc.Objects
+            if o.TypeId == "PartDesign::Body"
+            and (o.Name == DECK_NAME or o.Name.startswith(WHEEL_PREFIX))]
+
+
+def _delete_tree(doc, obj):
+    """Remove a Part Design Body with all its features (sketch, pad, origin)."""
+    kids = []
+    try:
+        kids = list(obj.Group)
+    except Exception:
+        kids = []
+    try:                                   # App::Origin keeps its planes/lines here
+        kids += list(obj.OriginFeatures)
+    except Exception:
+        pass
+
+    def prio(o):
+        return {"PartDesign::Pad": 0, "PartDesign::Pocket": 0,
+                "Sketcher::SketchObject": 1, "App::Plane": 2,
+                "App::Line": 2, "App::Origin": 3}.get(o.TypeId, 4)
+
+    for k in sorted(kids, key=prio):
+        _delete_tree(doc, k)
+    try:
+        doc.removeObject(obj.Name)
+    except Exception:
+        pass
+
+
+def _purge_generated(doc):
+    for body in _generated_bodies(doc):
+        _delete_tree(doc, body)
+    try:
+        doc.purgeDeletedBodies()
+    except Exception:
+        pass
+    _recompute(doc)
+
+
+# --------------------------------------------------------------------------- #
+# 5. Model creation / rebuild (geometry built eagerly, in a transaction)
+# --------------------------------------------------------------------------- #
+def _deck_placement(c):
+    import FreeCAD as App
+    zrot = 90.0 if c["width"] > c["length"] else 0.0
+    return App.Placement(App.Vector(0, 0, c["height"]),
+                         App.Rotation(App.Vector(0, 0, 1), zrot))
+
+
+def _wheel_placement(x, y, axis_z):
+    import FreeCAD as App
+    return App.Placement(App.Vector(x, y, axis_z),
+                         App.Rotation(App.Vector(1, 0, 0), 90))
+
+
+def build_geometry(doc, cfg, group):
+    """(Re)create the deck + wheels as Part Design bodies inside the group."""
+    import FreeCAD as App
+    c = read_cfg(cfg)
+    _purge_generated(doc)
+
+    def deck_draw(sk):
+        if c["layout"] == "Circular":
+            _draw_ellipse(sk, c["length"], c["width"])
+        elif c["layout"] == "Triangular":
+            _draw_triangle(sk, c["length"], c["width"])
+        else:
+            _draw_rect(sk, c["length"], c["width"])
+
+    label = "Deck_%s" % DECK_LABELS.get(c["layout"], "Deck")
+    deck = _make_solid_body(doc, DECK_NAME, deck_draw, c["thickness"],
+                            _deck_placement(c), False, DECK_COLOR, label)
+    if not _solid_ok(deck):
+        App.Console.PrintError("[RobotPlatform] deck did not generate (%s).\n" % c["layout"])
+
+    positions = wheel_positions(c["layout"], c["count"], c["length"], c["width"],
+                                c["base_pct"], c["track_pct"])
+
+    def wheel_draw(sk):
+        _draw_circle(sk, c["diameter"] / 2.0)
+
+    for i, (x, y) in enumerate(positions):
+        w = _make_solid_body(doc, "%s_%d" % (WHEEL_PREFIX, i + 1), wheel_draw,
+                             c["wheel_t"], _wheel_placement(x, y, c["axis_height"]),
+                             True, WHEEL_COLOR, "Wheel_%d" % (i + 1))
+        if not _solid_ok(w):
+            App.Console.PrintError("[RobotPlatform] wheel %d did not generate.\n" % (i + 1))
+
+    for o in [deck] + _generated_bodies(doc):
+        try:
+            if o is not None and o not in group.Group:
+                group.addObject(o)
+        except Exception:
+            pass
+    _recompute(doc)
+    return deck
+
+
+def update_check(doc, cfg):
+    """Recompute the bounding-box extents and store them on the controller."""
+    c = read_cfg(cfg)
+    dx, dy, dz = overall_extents(**c)
+    cfg.ExtentX, cfg.ExtentY, cfg.ExtentZ = dx, dy, dz
+    fits, msg = fit_check(dx, dy, dz)
+    cfg.FitsBBox = fits
+    cfg.FitStatus = msg
+    try:
+        import FreeCAD as App
+        (App.Console.PrintMessage if fits else App.Console.PrintWarning)(
+            "[RobotPlatform] %s\n" % msg)
+    except Exception:
+        pass
+    return fits, msg
+
+
+def find_or_make_group(doc):
+    group = find_group(doc)
+    if group is None:
+        group = doc.addObject("App::DocumentObjectGroup", GROUP_NAME)
+    return group
+
+
+def ensure_model(doc):
+    import FreeCAD as App
+    if doc is None:
+        doc = App.newDocument("RobotPlatform")
+    group = find_or_make_group(doc)
+    cfg = find_cfg(doc)
+    if cfg is None:
+        cfg = doc.addObject("App::FeaturePython", CFG_NAME)
+        PlatformController(cfg)
+        try:
+            if cfg.ViewObject is not None:
+                ControllerViewProvider(cfg.ViewObject)
+        except Exception:
+            pass
+        try:
+            if cfg not in group.Group:
+                group.addObject(cfg)
+        except Exception:
+            pass
+    return doc, group, cfg
+
+
+def rebuild(doc, cfg=None, group=None):
+    """Delete the generated solids and rebuild them from the current params."""
+    if cfg is None:
+        cfg = find_cfg(doc)
+    if group is None:
+        group = find_group(doc)
+    if cfg is None or group is None:
+        return
+    try:
+        import FreeCAD as App
+        App.openTransaction("RobotPlatform rebuild")
+    except Exception:
+        App = None
+    try:
+        build_geometry(doc, cfg, group)
+        update_check(doc, cfg)
+    finally:
+        if App is not None:
+            try:
+                App.commitTransaction()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# 6. Docked panel (QDockWidget inside the FreeCAD main window)
+# --------------------------------------------------------------------------- #
+def _main_window():
+    try:
+        import FreeCADGui as Gui
+        return Gui.getMainWindow()
+    except Exception:
+        return None
+
+
+def _qt():
+    try:
+        from PySide import QtWidgets, QtCore
+    except ImportError:
+        try:
+            from PySide2 import QtWidgets, QtCore
+        except ImportError:
+            from PySide6 import QtWidgets, QtCore
+    return QtWidgets, QtCore
+
+
+_DOCK_REF = {"dock": None}
+
+
+def _make_panel_class():
+    QtWidgets, QtCore = _qt()
+
+    class SliderRow(QtWidgets.QWidget):
+        def __init__(self, key, value, on_change, parent=None):
+            super().__init__(parent)
+            s = NUMERIC_SPEC[key]
+            self.key, self.lo, self.hi = key, s["lo"], s["hi"]
+            self._sync = False
+            lay = QtWidgets.QHBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            name = QtWidgets.QLabel(s["label"])
+            name.setMinimumWidth(160)
+            self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.slider.setRange(0, 1000)
+            self.spin = QtWidgets.QDoubleSpinBox()
+            self.spin.setRange(s["lo"], s["hi"])
+            self.spin.setDecimals(s["dec"])
+            self.spin.setSingleStep((s["hi"] - s["lo"]) / 200.0)
+            if s["unit"]:
+                self.spin.setSuffix(" " + s["unit"])
+            self.spin.setMinimumWidth(88)
+            self.spin.setKeyboardTracking(False)
+            lay.addWidget(name)
+            lay.addWidget(self.slider, 1)
+            lay.addWidget(self.spin)
+            self.setValue(value)
+            self._dragging = False
+            self.slider.sliderPressed.connect(self._press)
+            self.slider.sliderReleased.connect(self._release)
+            self.slider.valueChanged.connect(self._from_slider)
+            self.spin.valueChanged.connect(self._from_spin)
+            self.on_change = on_change
+
+        def _norm(self, v):
+            return int(round((v - self.lo) / (self.hi - self.lo) * 1000))
+
+        def _val(self, s):
+            return self.lo + s / 1000.0 * (self.hi - self.lo)
+
+        def setValue(self, v):
+            v = min(max(float(v), self.lo), self.hi)
+            self._sync = True
+            self.slider.setValue(self._norm(v))
+            self.spin.setValue(v)
+            self._sync = False
+
+        def value(self):
+            return min(max(float(self.spin.value()), self.lo), self.hi)
+
+        def _press(self):
+            self._dragging = True
+
+        def _release(self):
+            self._dragging = False
+            self.on_change(force=True)
+
+        def _from_slider(self, s):
+            if self._sync:
+                return
+            self._sync = True
+            self.spin.setValue(self._val(s))
+            self._sync = False
+            if not self._dragging:
+                self.on_change(force=False)
+
+        def _from_spin(self, v):
+            if self._sync:
+                return
+            self._sync = True
+            self.slider.setValue(self._norm(v))
+            self._sync = False
+            self.on_change(force=False)
+
+    class Panel(QtWidgets.QWidget):     # a plain widget, hosted inside the dock
+        def __init__(self, doc, cfg, parent=None):
+            super().__init__(parent)
+            self.doc, self.cfg = doc, cfg
+            self.setMinimumWidth(430)
+            self._debounce = QtCore.QTimer(self)
+            self._debounce.setSingleShot(True)
+            self._debounce.setInterval(250)
+            self._debounce.timeout.connect(lambda: self.apply(live=True))
+
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            inner = QtWidgets.QWidget()
+            root = QtWidgets.QVBoxLayout(inner)
+
+            form = QtWidgets.QFormLayout()
+            self.layout_box = QtWidgets.QComboBox()
+            self.layout_box.addItems(LAYOUTS)
+            self.layout_box.currentTextChanged.connect(self._combo_changed)
+            self.wheel_box = QtWidgets.QComboBox()
+            self.wheel_box.addItems(WHEEL_OPTIONS)
+            self.wheel_box.currentTextChanged.connect(self._combo_changed)
+            form.addRow("Platform layout", self.layout_box)
+            form.addRow("Wheels", self.wheel_box)
+            root.addLayout(form)
+
+            dims = QtWidgets.QGroupBox("Platform / wheels")
+            dl = QtWidgets.QVBoxLayout(dims)
+            self.rows = {}
+            for key in NUMERIC_KEYS[:6]:
+                row = SliderRow(key, float(getattr(cfg, key)), self._changed)
+                dl.addWidget(row)
+                self.rows[key] = row
+            root.addWidget(dims)
+
+            wheels = QtWidgets.QGroupBox("Wheel axis position")
+            wl = QtWidgets.QVBoxLayout(wheels)
+            for key in NUMERIC_KEYS[6:]:
+                row = SliderRow(key, float(getattr(cfg, key)), self._changed)
+                wl.addWidget(row)
+                self.rows[key] = row
+            root.addWidget(wheels)
+
+            self.info = QtWidgets.QLabel("")
+            self.info.setWordWrap(True)
+            root.addWidget(self.info)
+
+            btns = QtWidgets.QHBoxLayout()
+            self.live = QtWidgets.QCheckBox("Live preview")
+            self.btn_reset = QtWidgets.QPushButton("Reset")
+            self.btn_apply = QtWidgets.QPushButton("Apply")
+            self.btn_fit = QtWidgets.QPushButton("Fit view")
+            self.btn_close = QtWidgets.QPushButton("Close")
+            for w in (self.live, self.btn_reset, self.btn_apply, self.btn_fit, self.btn_close):
+                btns.addWidget(w)
+            root.addLayout(btns)
+            root.addStretch(1)
+
+            self.btn_apply.clicked.connect(self.apply)
+            self.btn_reset.clicked.connect(self.reset)
+            self.btn_fit.clicked.connect(self.fit_view)
+            self.btn_close.clicked.connect(self._on_close)
+
+            scroll.setWidget(inner)
+            outer = QtWidgets.QVBoxLayout(self)
+            outer.setContentsMargins(2, 2, 2, 2)
+            outer.addWidget(scroll)
+
+            self.pull_values()
+            self.refresh_info()
+
+        def _combo_changed(self, _txt):
+            self._changed(force=True)
+
+        def _changed(self, force=False):
+            if not self.live.isChecked():
+                return
+            if force:
+                self._debounce.stop()
+                self.apply(live=True)
+            else:
+                self._debounce.start()
+
+        def pull_values(self):
+            self.layout_box.setCurrentText(getattr(self.cfg, "Layout", LAYOUTS[0]))
+            self.wheel_box.setCurrentText(getattr(self.cfg, "Wheels", WHEEL_OPTIONS[2]))
+            for key, row in self.rows.items():
+                row.setValue(float(getattr(self.cfg, key)))
+
+        def push_values(self):
+            self.cfg.Layout = self.layout_box.currentText()
+            self.cfg.Wheels = self.wheel_box.currentText()
+            for key, row in self.rows.items():
+                setattr(self.cfg, key, row.value())
+
+        def apply(self, live=False):
+            self.push_values()
+            try:
+                rebuild(self.doc, self.cfg)
+            except Exception as exc:
+                if not live:
+                    QtWidgets.QMessageBox.warning(self, DOCK_TITLE, str(exc))
+            self.refresh_info()
+
+        def reset(self):
+            d = default_params()
+            self.layout_box.setCurrentText(LAYOUTS[0])
+            self.wheel_box.setCurrentText(WHEEL_OPTIONS[2])
+            for key, row in self.rows.items():
+                row.setValue(d[key])
+            self.apply()
+
+        def refresh_info(self):
+            cfg = self.cfg
+            try:
+                dx, dy, dz = overall_extents(**read_cfg(cfg))
+            except Exception:
+                dx, dy, dz = (float(getattr(cfg, "ExtentX", 0.0)),
+                              float(getattr(cfg, "ExtentY", 0.0)),
+                              float(getattr(cfg, "ExtentZ", 0.0)))
+            ok, msg = fit_check(dx, dy, dz)
+            color = "#1b7a1b" if ok else "#b00020"
+            bg = "#e6f4e6" if ok else "#fbe7ea"
+            self.info.setText(msg + ("\n  FITS the allowed box"
+                                     if ok else "\n  TOO BIG for the allowed box"))
+            self.info.setStyleSheet(
+                "padding:6px;border-radius:4px;color:%s;background:%s;font-weight:bold;"
+                % (color, bg))
+
+        def fit_view(self):
+            try:
+                import FreeCADGui as Gui
+                Gui.SendMsgToActiveView("ViewFit")
+            except Exception:
+                pass
+
+        def _on_close(self):
+            try:
+                self.window().hide()        # hides the dock (and any floating copy)
+            except Exception:
+                self.hide()
+
+    return Panel
+
+
+def _existing_dock(mw):
+    QtWidgets = _qt()[0]
+    dock = _DOCK_REF["dock"]
+    if dock is not None:
+        try:
+            dock.widget()
+            return dock
+        except RuntimeError:                # C++ object deleted
+            _DOCK_REF["dock"] = None
+    try:
+        return mw.findChild(QtWidgets.QDockWidget, DOCK_NAME)
+    except Exception:
+        return None
+
+
+def show_dock(doc=None, cfg=None):
+    """Open (or re-raise) the parametric panel docked inside the FreeCAD window."""
+    QtWidgets, QtCore = _qt()
+    import FreeCAD as App
+    if doc is None:
+        doc = App.ActiveDocument or App.newDocument("RobotPlatform")
+    doc, group, cfg = ensure_model(doc)
+    if not _generated_bodies(doc):
+        rebuild(doc, cfg, group)
+
+    mw = _main_window()
+    if mw is None:                          # no GUI (console / batch)
+        print("RobotPlatform model built (no GUI). Run inside the FreeCAD GUI "
+              "to dock the panel.")
+        return None
+
+    dock = _existing_dock(mw)
+    if dock is None:
+        dock = QtWidgets.QDockWidget(DOCK_TITLE, mw)
+        dock.setObjectName(DOCK_NAME)
+        dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)
+        try:
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetClosable
+                             | QtWidgets.QDockWidget.DockWidgetMovable
+                             | QtWidgets.QDockWidget.DockWidgetFloatable)
+        except Exception:
+            pass
+        dock.setWidget(_make_panel_class()(doc, cfg, dock))
+        mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+        _DOCK_REF["dock"] = dock
+
+    panel = dock.widget()
+    try:
+        panel.cfg, panel.doc = cfg, doc
+        panel.pull_values()
+        panel.refresh_info()
+    except Exception:
+        pass
+    dock.show()
+    dock.raise_()
+    try:
+        mw.setCurrentDockWidget(dock)       # bring the tab to the front if tabbed
+    except Exception:
+        pass
+    return dock
+
+
+show_dialog = show_dock                     # back-compatible name
+
+
+def close_dock():
+    mw = _main_window()
+    if mw is None:
+        return
+    dock = _existing_dock(mw)
+    if dock is not None:
+        dock.hide()
+
+
+# --------------------------------------------------------------------------- #
+# 7. FreeCAD command + menu
+# --------------------------------------------------------------------------- #
+class PlatformCommand:
+    def GetResources(self):
+        return {"MenuText": "Robotic Platform Generator",
+                "ToolTip": "Create / open the parametric warehouse-robot platform",
+                "Pixmap": ""}
+
+    def IsActive(self):
+        return True
+
+    def Activated(self):
+        open_platform(show=True)
+
+
+def _append_menu():
+    try:
+        import FreeCADGui as Gui
+        try:
+            if not Gui.getCommand("RobotPlatform_Generator"):
+                Gui.addCommand("RobotPlatform_Generator", PlatformCommand())
+        except Exception:
+            pass
+        menubar = Gui.getMainWindow().menuBar()
+        macro_menu = next((a.menu() for a in menubar.actions()
+                           if a.text().lower().startswith("macro")), None)
+        if macro_menu is None:
+            macro_menu = menubar.addMenu("Macro")
+        if all(a.text() != "Robotic Platform Generator" for a in macro_menu.actions()):
+            macro_menu.addAction("Robotic Platform Generator",
+                                 lambda: PlatformCommand().Activated())
+    except Exception:
+        pass
+
+
+def _activate_view(doc):
+    try:
+        import FreeCADGui as Gui
+        Gui.updateGui()
+        try:
+            Gui.setActiveDocument(doc.Name)
+        except Exception:
+            pass
+        Gui.SendMsgToActiveView("ViewFit")
+        Gui.updateGui()
+    except Exception:
+        pass
+
+
+def open_platform(show=True):
+    import FreeCAD as App
+    try:
+        import FreeCADGui as Gui
+    except Exception:
+        Gui = None
+    try:
+        doc = App.ActiveDocument
+        if find_cfg(doc) is None or not _generated_bodies(doc):
+            doc, group, cfg = ensure_model(doc)
+            try:
+                App.openTransaction("RobotPlatform build")
+            except Exception:
+                pass
+            try:
+                rebuild(doc, cfg, group)
+            finally:
+                try:
+                    App.commitTransaction()
+                except Exception:
+                    pass
+        if Gui is not None:
+            _append_menu()
+            _activate_view(doc)
+            if show:
+                show_dock(doc)
+        else:
+            print("RobotPlatform model built (no GUI). Open inside FreeCAD GUI "
+                  "to dock the panel.")
+        return doc
+    except Exception as exc:
+        try:
+            _qt()[0].QMessageBox.critical(None, DOCK_TITLE,
+                                          "Robotic Platform Generator failed:\n\n%s" % exc)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        return None
+
+
+def run():
+    open_platform(show=True)
+
+
+# --------------------------------------------------------------------------- #
+# Headless self-test of the Part-free maths
+# --------------------------------------------------------------------------- #
+def _selftest():
+    d = default_params()
+    args = lambda layout, count: overall_extents(
+        layout, count, d["platform_length"], d["platform_width"],
+        d["platform_thickness"], d["platform_height"], d["wheel_diameter"],
+        d["wheel_thickness"], d["wheel_axis_height"], d["wheel_base_pct"],
+        d["wheel_track_pct"])
+    assert wheel_positions("Rectangular", 0, 240, 180, .7, .7) == []
+    for layout in LAYOUTS:
+        for n in (0, 3, 4):
+            assert len(wheel_positions(layout, n, 240, 180, .7, .7)) == n
+            dx, dy, dz = args(layout, n)
+            assert dx > 0 and dy > 0 and dz > 0
+    for layout in LAYOUTS:
+        for n in (0, 3, 4):
+            ok, msg = fit_check(*args(layout, n))
+            assert ok, "%s/%d: %s" % (layout, n, msg)
+    assert not fit_check(320, 100, 100)[0]
+    assert not fit_check(100, 100, 205)[0]
+    print("selftest OK")
+    print("  rect/4:", fit_check(*args("Rectangular", 4))[1])
+    print("  circ/3:", fit_check(*args("Circular", 3))[1])
+    print("  tri/0 :", fit_check(*args("Triangular", 0))[1])
+    return True
+
+
+try:
+    import FreeCAD          # noqa: F401  (only available inside FreeCAD)
+    _IN_FREECAD = True
+except Exception:
+    _IN_FREECAD = False
+
+if _IN_FREECAD:
+    run()
+elif __name__ == "__main__":
+    import sys as _sys
+    if "--selftest" in _sys.argv:
+        _selftest()
+    else:
+        print(__doc__)
